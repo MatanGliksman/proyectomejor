@@ -1,0 +1,183 @@
+import base64
+import qrcode
+import cv2
+import numpy as np
+import platform
+import subprocess
+import os
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+
+# --- CONFIGURATION ---
+MAX_QR_BYTES = 200
+BATCH_SIZE = 10          # FIX: increased from 5 to reduce SYNC_CHECK freeze time
+HEADER_SEP = ":"
+COUNT_SEP = "/"
+
+# --- ENCRYPTION ---
+def generate_aes_key():
+    """Generates a fresh random 256-bit AES key. Called once per session."""
+    return os.urandom(32)  # 32 bytes = 256 bits
+
+def encrypt_chunk(data_str, aes_key):
+    """
+    Encrypts a base64 chunk string using AES-256-GCM.
+    Returns: base64-encoded string of  IV + TAG + CIPHERTEXT
+    A new random IV is generated for every single chunk.
+    """
+    iv = os.urandom(12)  # 96-bit IV, standard for GCM
+    encryptor = Cipher(
+        algorithms.AES(aes_key),
+        modes.GCM(iv),
+        backend=default_backend()
+    ).encryptor()
+
+    ciphertext = encryptor.update(data_str.encode('utf-8')) + encryptor.finalize()
+    tag = encryptor.tag  # 16-byte authentication tag
+
+    # Pack: IV (12) + TAG (16) + CIPHERTEXT, then base64 encode the whole thing
+    combined = iv + tag + ciphertext
+    return base64.b64encode(combined).decode('utf-8')
+
+def decrypt_chunk(encrypted_str, aes_key):
+    """
+    Decrypts a chunk produced by encrypt_chunk.
+    Returns the original plaintext string, or raises on tamper/wrong key.
+    """
+    combined = base64.b64decode(encrypted_str.encode('utf-8'))
+    iv        = combined[:12]
+    tag       = combined[12:28]
+    ciphertext = combined[28:]
+
+    decryptor = Cipher(
+        algorithms.AES(aes_key),
+        modes.GCM(iv, tag),
+        backend=default_backend()
+    ).decryptor()
+
+    plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+    return plaintext.decode('utf-8')
+
+def key_to_str(aes_key):
+    """Encodes the AES key as a base64 string for embedding in the SYN QR."""
+    return base64.b64encode(aes_key).decode('utf-8')
+
+def str_to_key(key_str):
+    """Decodes a base64 key string back to bytes."""
+    return base64.b64decode(key_str.encode('utf-8'))
+
+# --- ENCODING ---
+def encode_data_to_payloads(data_bytes, aes_key):
+    """Encodes and ENCRYPTS file bytes into a list of protocol strings."""
+    b64_data = base64.b64encode(data_bytes).decode('utf-8')
+    chunks = [b64_data[i:i + MAX_QR_BYTES] for i in range(0, len(b64_data), MAX_QR_BYTES)]
+    total = len(chunks)
+    payloads = []
+    for i, c in enumerate(chunks):
+        encrypted = encrypt_chunk(c, aes_key)
+        payloads.append(f"{i + 1}{COUNT_SEP}{total}{HEADER_SEP}{encrypted}")
+    return payloads
+
+# --- VISUALS ---
+def generate_qr_image(payload, current_index, total_count, title=None):
+    """Generates a QR with green border."""
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10,
+        border=2
+    )
+    qr.add_data(payload)
+    qr.make(fit=True)
+    img_pil = qr.make_image(fill_color="black", back_color="white").convert('RGB')
+    img_cv = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    img_cv = cv2.copyMakeBorder(img_cv, 50, 50, 50, 50, cv2.BORDER_CONSTANT, value=(0, 255, 0))
+
+    if title:
+        text = title
+    else:
+        text = f"Packet {current_index}/{total_count}"
+
+    cv2.putText(img_cv, text, (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+    return img_cv
+
+# --- PARSING ---
+def parse_qr_payload(text):
+    """Parses standard data chunks (INDEX/TOTAL:ENCRYPTED_DATA)."""
+    try:
+        if HEADER_SEP not in text or COUNT_SEP not in text:
+            return None
+        header, data = text.split(HEADER_SEP, 1)
+        idx_str, total_str = header.split(COUNT_SEP)
+        return int(idx_str), int(total_str), data
+    except (ValueError, IndexError):
+        return None
+
+def parse_control_msg(text):
+    """
+    Parses control messages: SYN (with embedded AES key), ACK, NACK, SYNC_CHECK, DONE.
+    SYN format: SYN:{total}:{filename}:{base64_aes_key}
+    """
+    try:
+        if text.startswith("SYN:"):
+            parts = text.split(":")
+            # parts[0]=SYN, parts[1]=total, parts[2]=filename, parts[3]=key
+            # NOTE: filename could contain colons on Windows paths, so we use fixed positions
+            return "SYN", {
+                "total":    int(parts[1]),
+                "filename": parts[2],
+                "key":      parts[3]   # base64-encoded AES key
+            }
+        elif text.startswith("ACK:"):
+            val = text.split(":")[1]
+            # FIX Bug 3: handshake ACK uses "READY" not a number, so we handle both
+            if val == "READY":
+                return "ACK", "READY"
+            return "ACK", int(val)
+        elif text.startswith("NACK:"):
+            parts = text.split(":")
+            missing = [int(x) for x in parts[2].split(",")] if len(parts) > 2 and parts[2] else []
+            return "NACK", {"batch_id": int(parts[1]), "missing": missing}
+        elif text.startswith("SYNC_CHECK:"):
+            return "SYNC_CHECK", int(text.split(":")[1])
+        elif text == "DONE":
+            return "DONE", None
+    except (ValueError, IndexError):
+        pass
+    return "DATA", None
+
+# --- FILE REBUILDING ---
+def rebuild_file(received_chunks_dict, total_chunks, aes_key, filename="received_file"):
+    """Decrypts and reassembles all chunks back into the original file."""
+    print("\n🔨 Reassembling and decrypting file...")
+    try:
+        decrypted_chunks = []
+        for i in range(1, total_chunks + 1):
+            decrypted = decrypt_chunk(received_chunks_dict[i], aes_key)
+            decrypted_chunks.append(decrypted)
+
+        sorted_data = "".join(decrypted_chunks)
+        file_bytes = base64.b64decode(sorted_data)
+
+        save_dir = "received_files"
+        os.makedirs(save_dir, exist_ok=True)
+        filepath = os.path.join(save_dir, filename)
+        with open(filepath, "wb") as f:
+            f.write(file_bytes)
+
+        print(f"✅ File saved: {filepath}")
+        return filepath
+    except Exception as e:
+        print(f"❌ Rebuild error: {e}")
+        return None
+
+def open_file_native(path):
+    try:
+        if platform.system() == 'Windows':
+            os.startfile(path)
+        elif platform.system() == 'Darwin':
+            subprocess.call(('open', path))
+        else:
+            subprocess.call(('xdg-open', path))
+    except Exception:
+        print("⚠️ Could not auto-open.")
