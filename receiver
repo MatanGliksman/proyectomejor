@@ -1,0 +1,182 @@
+import cv2
+import numpy as np
+import qr_protocol
+import time
+import sys
+
+try:
+    from pyzbar.pyzbar import decode, ZBarSymbol
+    USING_PYZBAR = True
+    print("✅ Logic: Using Pyzbar (High Performance)")
+except ImportError:
+    USING_PYZBAR = False
+    print("⚠️ Logic: Pyzbar not found. Using Standard OpenCV (Slower).")
+    print("   (Tip: Run 'pip install pyzbar' for better speed)")
+
+WINDOW_NAME = "Receiver"
+
+
+def show_ack_on_frame(frame, text, title):
+    img = qr_protocol.generate_qr_image(text, 0, 0, title=title)
+    cv2.namedWindow("ACK", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("ACK", 400, 400)
+    cv2.imshow("ACK", img)
+    cv2.waitKey(1000)  # 0.3 seconds — short but enough for sender to catch it
+    cv2.destroyWindow("ACK")
+    return frame
+
+def scan_frame(frame, detector):
+    """
+    Detects QR codes using pyzbar or OpenCV fallback.
+    Returns: list of (data_string, polygon_points)
+    """
+    results = []
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    if USING_PYZBAR:
+        decoded_objs = decode(gray, symbols=[ZBarSymbol.QRCODE])
+        for obj in decoded_objs:
+            data = obj.data.decode("utf-8")
+            pts = np.array(obj.polygon, dtype=np.int32)
+            results.append((data, pts))
+    else:
+        _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        data, points, _ = detector.detectAndDecode(binary)
+        if data and points is not None:
+            pts = points.astype(int)
+            results.append((data, pts))
+
+    return results
+
+
+def main():
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(0)
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    detector = None
+    if not USING_PYZBAR:
+        detector = cv2.QRCodeDetector()
+
+    print("=== RECEIVER LISTENING (Encrypted) ===")
+
+    received_chunks = {}
+    total_expected = 0
+    state = "WAITING_HANDSHAKE"
+    filename = "unknown"
+    current_batch = 0
+    aes_key = None          # Will be set when SYN is received
+    ack_display_until = 0   # Timestamp — show the ACK overlay until this time
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        found_qrs = scan_frame(frame, detector)
+
+        for data, pts in found_qrs:
+            # Draw green detection box
+            if USING_PYZBAR:
+                cv2.polylines(frame, [pts], True, (0, 255, 0), 3)
+            else:
+                for i in range(len(pts)):
+                    pt1 = tuple(pts[i][0])
+                    pt2 = tuple(pts[(i + 1) % len(pts)][0])
+                    cv2.line(frame, pt1, pt2, (0, 255, 0), 3)
+
+            mtype, content = qr_protocol.parse_control_msg(data)
+
+            # --- STATE MACHINE ---
+
+            if state == "WAITING_HANDSHAKE":
+                if mtype == "SYN":
+                    total_expected = content['total']
+                    filename       = content['filename']
+                    key_str        = content['key']
+
+                    # Extract and store the AES key for this session
+                    aes_key = qr_protocol.str_to_key(key_str)
+                    print(f"✅ Handshake! File: {filename} ({total_expected} chunks)")
+                    print(f"🔑 Encryption key received and stored.")
+
+                    # FIX Bug 3: reply with ACK:READY (not ACK:{total}) to avoid collision
+                    frame = show_ack_on_frame(frame, "ACK:READY", "HANDSHAKE ACCEPTED")
+                    ack_display_until = time.time() + 0.3   # FIX Bug 4: 0.3s not 2s
+                    state = "RECEIVING"
+
+            elif state == "RECEIVING":
+                if mtype == "DATA":
+                    res = qr_protocol.parse_qr_payload(data)
+                    if res:
+                        idx, tot, encrypted_chunk = res
+                        if idx not in received_chunks:
+                            # Store the encrypted chunk as-is; decrypt at the end
+                            received_chunks[idx] = encrypted_chunk
+                            print(f"   📥 Chunk {idx}/{tot}")
+
+                elif mtype == "SYNC_CHECK":
+                    batch_id = content
+                    if batch_id == current_batch:
+                        start  = batch_id * qr_protocol.BATCH_SIZE
+                        end    = min(start + qr_protocol.BATCH_SIZE, total_expected)
+                        needed = range(start + 1, end + 1)
+                        missing = [i for i in needed if i not in received_chunks]
+
+                        if not missing:
+                            print(f"✅ Batch {batch_id} complete.")
+                            frame = show_ack_on_frame(frame, f"ACK:{batch_id}", "BATCH RECEIVED")
+                            ack_display_until = time.time() + 0.3  # FIX Bug 4
+                            current_batch += 1
+                        else:
+                            print(f"⚠️ Batch {batch_id} missing: {missing}")
+                            missing_str = ",".join(map(str, missing))
+                            frame = show_ack_on_frame(
+                                frame, f"NACK:{batch_id}:{missing_str}", "RETRY REQUEST"
+                            )
+                            ack_display_until = time.time() + 0.3  # FIX Bug 4
+
+                elif mtype == "DONE":
+                    # FIX Bug 5: sender explicitly signals DONE, receiver rebuilds here
+                    print("📡 DONE signal received. Rebuilding file...")
+                    if aes_key and len(received_chunks) == total_expected:
+                        path = qr_protocol.rebuild_file(
+                            received_chunks, total_expected, aes_key, filename
+                        )
+                        if path:
+                            qr_protocol.open_file_native(path)
+                    else:
+                        missing_count = total_expected - len(received_chunks)
+                        print(f"⚠️ DONE received but still missing {missing_count} chunks.")
+                    break
+
+        # --- GUI OVERLAY ---
+        cv2.putText(frame, f"State: {state}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        if aes_key:
+            cv2.putText(frame, "🔑 ENCRYPTED", (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        if total_expected > 0:
+            count = len(received_chunks)
+            cv2.putText(frame, f"Progress: {count}/{total_expected}", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        cv2.imshow(WINDOW_NAME, frame)
+
+        # FIX Bug 5: removed the "len == total_expected" early break.
+        # We now wait for the explicit DONE signal from the sender instead.
+
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
